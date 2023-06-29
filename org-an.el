@@ -5,7 +5,6 @@
 ;; Dependencies: Anki, AnkiConnect should be installed and running.
 
 ;; TODO:
-;; - Implement `org-an--update-note'.
 ;; - Guard ankiConnect and Anki versions.
 ;; - Make HTML export async. Check out `org-export-async-start', for an example
 ;;   of async elisp based on processes, or see (info "(elisp) Threads") for an
@@ -117,7 +116,7 @@ is set."
 (cl-defstruct org-an--note
   "Note structure resembling the AnkiConnect Note object."
   (id nil
-      :type (or nil string)
+      :type (or nil integer)
       :documentation "Anki note ID.")
   (deck nil
         :type string
@@ -144,7 +143,7 @@ is set."
 
 Returns `org-an--note' object where NOTE-ID is nil if the
 \"ANKI_NOTE_ID\" property is not set."
-  (let ((note-id (org-entry-get (point) "ANKI_NOTE_ID"))
+  (let ((note-id (string-to-number (org-entry-get (point) "ANKI_NOTE_ID")))
         (deck-name (org-an--get-deck))
         (note-type (or (org-entry-get (point) "ANKI_NOTE_TYPE" t)
                        org-an-default-note-type))
@@ -342,8 +341,9 @@ constructed in order to correctly store \"ANKI_NOTE_ID\" property."
       :as (lambda () (json-parse-buffer :object-type 'plist))
       :then (lambda (response)
               (pcase (plist-get response :error)
-                ;; If success set ANKI_NOTE_ID property.
-                (:null (org-an--put-note-id file (plist-get response :result) entry-id))
+                ;; If success, then set ANKI_NOTE_ID property.
+                (:null (org-an--put-note-id file (plist-get response :result) entry-id)
+                       (message "Successfully created note %d" note-id))
                 ;; If error, then message it.
                 (err (message "AnkiConnect addNote failed with \"%s\"" err))))
       :finally (lambda ()
@@ -354,9 +354,48 @@ constructed in order to correctly store \"ANKI_NOTE_ID\" property."
                        (unless where (error "ID %s not found" entry-id))
                        (org-entry-delete where "ID"))))))))
 
-(defun org-an--update-note (entry)
-  "Update Anki note based on the ENTRY."
-  (print entry))
+(defun org-an--update-note (note)
+  "Update Anki note based on the NOTE."
+  (let* ((payload `( :action "updateNote"
+                     :version 6
+                     :params
+                     (:note
+                      ( :id ,(org-an--note-id note)
+                        :fields ,(org-an--note-fields note)
+                        :tags ,(vconcat (org-an--note-tags note))))))
+         (body (json-serialize payload))
+         (media (org-an--note-media note)))
+
+    (plz 'post org-an-ankiconnect-host
+      :body body
+      :as (lambda () (json-parse-buffer :object-type 'plist))
+      :then (lambda (response)
+              (pcase (plist-get response :error)
+                ;; If success, then upload media if there is any.
+                (:null (if (null media)
+                           (message "Successfully updated note %s" (org-an--note-id note))
+                         (message "Successfully updated note %d fields and tags, uploading media now..."
+                                  (org-an--note-id note))
+                         (mapcar #'org-an--upload-media media)))
+                (err (message "AnkiConnect updateNote failed with \"%s\"" err)))))))
+
+(defun org-an--upload-media (media)
+  "Upload media file MEDIA, represented as (PATH . ENCODED-NAME), to Anki."
+  (let* ((path (car media))
+         (encoded-name (cdr media))
+         (payload `( :action "storeMediaFile"
+                     :version 6
+                     :params ( :filename ,encoded-name
+                               :path ,(file-truename path))))
+         (body (json-serialize payload)))
+    (plz 'post org-an-ankiconnect-host
+      :body body
+      :as (lambda () (json-parse-buffer :object-type 'plist))
+      :then (lambda (response)
+              (pcase (plist-get response :error)
+                ;; If success, then upload media if there is any.
+                (:null (message "Successfully uploaded %s" path))
+                (err (message "AnkiConnect storeMediaFile for %s failed with %s." path err)))))))
 
 (defun org-an--put-note-id (file note-id entry-id)
   "Put NOTE-ID to the \"ANKI_NOTE_ID\" property in FILE.
@@ -364,8 +403,7 @@ constructed in order to correctly store \"ANKI_NOTE_ID\" property."
 Entry is identified by the ID property value (ENTRY-ID)."
   (let ((where (org-id-find-id-in-file entry-id file 'marker)))
     (unless where (error "ID %s not found" entry-id))
-    (org-entry-put where "ANKI_NOTE_ID" (number-to-string note-id)))
-  (message "Note %d was successfully created." note-id))
+    (org-entry-put where "ANKI_NOTE_ID" (number-to-string note-id))))
 
 (provide 'org-an)
 
