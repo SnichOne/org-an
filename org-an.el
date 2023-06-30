@@ -110,6 +110,15 @@ is set."
         (org-an--update-note note)
       (org-an--create-note note))))
 
+;;;###autoload
+(defun org-an-delete-note ()
+  "Delete Anki note corresponding to entry at point if there is one.
+
+The note is considered to exist if the \"ANKI_NOTE_ID\" property
+is set."
+  (interactive)
+  (org-an--delete-note))
+
 
 ;;; Entry parsing
 
@@ -143,7 +152,7 @@ is set."
 
 Returns `org-an--note' object where NOTE-ID is nil if the
 \"ANKI_NOTE_ID\" property is not set."
-  (let ((note-id (string-to-number (org-entry-get (point) "ANKI_NOTE_ID")))
+  (let ((note-id (org-entry-get (point) "ANKI_NOTE_ID"))
         (deck-name (org-an--get-deck))
         (note-type (or (org-entry-get (point) "ANKI_NOTE_TYPE" t)
                        org-an-default-note-type))
@@ -304,6 +313,7 @@ CONTENTS is nil. INFO is a plist holding export options."
 
 
 ;;; AnkiConnect HTTP calls
+
 (defun org-an--create-note (note)
   "Create new Anki note based on the NOTE.
 
@@ -342,25 +352,27 @@ constructed in order to correctly store \"ANKI_NOTE_ID\" property."
       :then (lambda (response)
               (pcase (plist-get response :error)
                 ;; If success, then set ANKI_NOTE_ID property.
-                (:null (org-an--put-note-id file (plist-get response :result) entry-id)
-                       (message "Successfully created note %d" note-id))
+                (:null (let ((note-id (plist-get response :result)))
+                         (org-an--put-note-id file entry-id note-id)
+                         (message "Successfully created note %d" note-id)))
                 ;; If error, then message it.
                 (err (message "AnkiConnect addNote failed with \"%s\"" err))))
       :finally (lambda ()
                  "Clean entry id if it was nil."
-                 (save-excursion
-                   (unless entry-id-was-nil
+                 (unless entry-id-was-nil
+                   (save-mark-and-excursion
                      (let ((where (org-id-find-id-in-file entry-id file 'marker)))
                        (unless where (error "ID %s not found" entry-id))
                        (org-entry-delete where "ID"))))))))
 
 (defun org-an--update-note (note)
   "Update Anki note based on the NOTE."
-  (let* ((payload `( :action "updateNote"
+  (let* ((note-id (string-to-number (org-an--note-id note)))
+         (payload `( :action "updateNote"
                      :version 6
                      :params
                      (:note
-                      ( :id ,(org-an--note-id note)
+                      ( :id ,note-id
                         :fields ,(org-an--note-fields note)
                         :tags ,(vconcat (org-an--note-tags note))))))
          (body (json-serialize payload))
@@ -373,9 +385,9 @@ constructed in order to correctly store \"ANKI_NOTE_ID\" property."
               (pcase (plist-get response :error)
                 ;; If success, then upload media if there is any.
                 (:null (if (null media)
-                           (message "Successfully updated note %s" (org-an--note-id note))
+                           (message "Successfully updated note %d" note-id)
                          (message "Successfully updated note %d fields and tags, uploading media now..."
-                                  (org-an--note-id note))
+                                  note-id)
                          (mapcar #'org-an--upload-media media)))
                 (err (message "AnkiConnect updateNote failed with \"%s\"" err)))))))
 
@@ -393,11 +405,47 @@ constructed in order to correctly store \"ANKI_NOTE_ID\" property."
       :as (lambda () (json-parse-buffer :object-type 'plist))
       :then (lambda (response)
               (pcase (plist-get response :error)
-                ;; If success, then upload media if there is any.
                 (:null (message "Successfully uploaded %s" path))
-                (err (message "AnkiConnect storeMediaFile for %s failed with %s." path err)))))))
+                (err (message
+                      "AnkiConnect storeMediaFile for %s failed with %s."
+                      path err)))))))
 
-(defun org-an--put-note-id (file note-id entry-id)
+(defun org-an--delete-note ()
+  "Delete Anki note corresponding to entry at point if there is one."
+  (let ((note-id (org-entry-get (point) "ANKI_NOTE_ID")))
+    (if (not note-id)
+        (message "\"ANKI_NOTE_ID\" property is nil in the entry.")
+      (let* ((payload `( :action "deleteNotes"
+                         :version 6
+                         :params (:notes [,(string-to-number note-id)])))
+             (body (json-serialize payload))
+             ;; Store the entry ID so we can later find the entry and delete the
+             ;; "ANKI_NOTE_ID" property. In the case the entry ID is nil,
+             ;; remember that and create one.
+             (entry-id-was-nil (org-entry-get (point) "ID"))
+             (entry-id (org-id-get-create))
+             (file (buffer-file-name)))
+        (plz 'post org-an-ankiconnect-host
+          :body body
+          :as (lambda () (json-parse-buffer :object-type 'plist))
+          :then (lambda (response)
+                  (pcase (plist-get response :error)
+                    (:null (save-mark-and-excursion
+                             (let ((where (org-id-find-id-in-file entry-id file 'marker)))
+                               (unless where (error "ID %s not found" entry-id))
+                               (org-entry-delete where "ANKI_NOTE_ID")))
+                           (message "Successfully deleted note %s" note-id))
+                    (err (message "AnkiConnect deleteNotes failed with %s." err))))
+          :finally (lambda ()
+                     "Clean entry id if it was nil."
+                     (unless entry-id-was-nil
+                       (save-mark-and-excursion
+                         (let ((where (org-id-find-id-in-file entry-id file 'marker)))
+                           (unless where (error "ID %s not found" entry-id))
+                           (org-entry-delete where "ID"))))))))))
+
+
+(defun org-an--put-note-id (file entry-id note-id)
   "Put NOTE-ID to the \"ANKI_NOTE_ID\" property in FILE.
 
 Entry is identified by the ID property value (ENTRY-ID)."
